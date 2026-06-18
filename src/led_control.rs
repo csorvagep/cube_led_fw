@@ -1,49 +1,49 @@
 use esp_hal_smartled::SmartLedsAdapter;
 use smart_leds::{RGB8, SmartLedsWrite as _};
 
-pub const NUM_LEDS: usize = 50;
+pub const NUM_LEDS: usize = 150;
 
 const COLS: usize = 5;
-const LEVEL: u8 = 180;
+const LEVEL: u8 = 30;
 
-const BLACK: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
-const RED: RGB8 = RGB8 {
+pub const BLACK: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
+pub const RED: RGB8 = RGB8 {
     r: LEVEL,
     g: 0,
     b: 0,
 };
-const GREEN: RGB8 = RGB8 {
+pub const GREEN: RGB8 = RGB8 {
     r: 0,
     g: LEVEL,
     b: 0,
 };
-const BLUE: RGB8 = RGB8 {
+pub const BLUE: RGB8 = RGB8 {
     r: 0,
     g: 0,
     b: LEVEL,
 };
-const YELLOW: RGB8 = RGB8 {
+pub const YELLOW: RGB8 = RGB8 {
     r: LEVEL,
     g: LEVEL,
     b: 0,
 };
-const MAGENTA: RGB8 = RGB8 {
+pub const MAGENTA: RGB8 = RGB8 {
     r: LEVEL,
     g: 0,
     b: LEVEL,
 };
-const CYAN: RGB8 = RGB8 {
+pub const CYAN: RGB8 = RGB8 {
     r: 0,
     g: LEVEL,
     b: LEVEL,
 };
-const WHITE: RGB8 = RGB8 {
+pub const WHITE: RGB8 = RGB8 {
     r: LEVEL,
     g: LEVEL,
     b: LEVEL,
 };
 
-const COLOR_WHEEL: [RGB8; 8] = [BLACK, RED, GREEN, BLUE, YELLOW, MAGENTA, CYAN, WHITE];
+const COLOR_WHEEL: [RGB8; 8] = [RED, GREEN, BLUE, YELLOW, MAGENTA, CYAN, WHITE, BLACK];
 
 fn meander_index(logical: usize) -> usize {
     let row = logical / COLS;

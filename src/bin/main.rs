@@ -7,7 +7,8 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
-use cubeled::led_control::{LedControl, NUM_LEDS};
+use cubeled::led_control::{LedControl, NUM_LEDS, YELLOW};
+use defmt::info;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
@@ -28,11 +29,11 @@ esp_bootloader_esp_idf::esp_app_desc!();
 #[main]
 fn main() -> ! {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let _peripherals = esp_hal::init(config);
+    let peripherals = esp_hal::init(config);
 
     // LD_ON pin
     let mut ld_on = Output::new(
-        _peripherals.GPIO7,
+        peripherals.GPIO7,
         esp_hal::gpio::Level::Low,
         OutputConfig::default(),
     );
@@ -40,25 +41,30 @@ fn main() -> ! {
 
     // BTN
     let btn = Input::new(
-        _peripherals.GPIO9,
+        peripherals.GPIO9,
         InputConfig::default().with_pull(Pull::Up),
     );
 
     // LED driver
-    let rmt = Rmt::new(_peripherals.RMT, Rate::from_mhz(80)).unwrap();
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
     let mut led_buffer = smart_led_buffer!(NUM_LEDS);
-    let leds = SmartLedsAdapter::new(rmt.channel0, _peripherals.GPIO8, &mut led_buffer);
+    let leds = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
     let mut led_control = LedControl::new(leds);
 
     let delay = Delay::new();
 
     let mut button_state = btn.is_high();
 
+    info!("CubeLED started");
+    info!("Filling cube with color YELLOW");
+    led_control.fill(YELLOW);
+
     loop {
         let current_btn_state = btn.is_high();
         if button_state != current_btn_state {
             if !current_btn_state {
                 led_control.on_button_press();
+                info!("Button pressed");
             }
         }
         button_state = current_btn_state;
