@@ -14,6 +14,7 @@ use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::main;
 use esp_hal::rmt::Rmt;
+use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
 use {esp_backtrace as _, esp_println as _};
@@ -58,6 +59,24 @@ fn main() -> ! {
     info!("CubeLED started");
     info!("Filling cube with color YELLOW");
     led_control.fill(YELLOW);
+
+    // SPI
+    let mosi = peripherals.GPIO3;
+    let miso = peripherals.GPIO1;
+    let sck = peripherals.GPIO0;
+    let cs = peripherals.GPIO10;
+
+    let mut spi = Spi::new(peripherals.SPI2, Config::default())
+        .expect("Failed to acquire SPI2")
+        .with_mosi(mosi)
+        .with_miso(miso)
+        .with_sck(sck)
+        .with_cs(cs);
+
+    let mut data = [0x0B, 0x2D, 0x00];
+    spi.transfer(&mut data).expect("Failed to transfer data");
+
+    info!("Received data: {}", data[2]);
 
     loop {
         let current_btn_state = btn.is_high();
