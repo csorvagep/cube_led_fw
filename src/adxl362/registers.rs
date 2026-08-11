@@ -66,6 +66,7 @@ pub const ACT_INACT_CTL_ACT_REF: u8 = 1 << 1;
 pub const ACT_INACT_CTL_INACT_EN: u8 = 1 << 2;
 pub const ACT_INACT_CTL_INACT_REF: u8 = 1 << 3;
 // LINKLOOP occupies bits [5:4].
+pub const ACT_INACT_CTL_LINKLOOP_MASK: u8 = 0b11 << 4;
 pub const ACT_INACT_CTL_LINKLOOP_DEFAULT: u8 = 0b00 << 4;
 pub const ACT_INACT_CTL_LINKLOOP_LINKED: u8 = 0b01 << 4;
 pub const ACT_INACT_CTL_LINKLOOP_LOOP: u8 = 0b11 << 4;

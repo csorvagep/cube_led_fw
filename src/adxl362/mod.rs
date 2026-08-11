@@ -97,6 +97,61 @@ impl NoiseMode {
     }
 }
 
+/// Configuration for the activity (motion start) detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct ActivityConfig {
+    /// 11-bit unsigned threshold the acceleration samples are compared against.
+    pub threshold: u16,
+    /// Activity timer value; the resulting time in seconds is `time / ODR`.
+    pub time: u8,
+    /// Compare against a captured reference instead of an absolute value.
+    pub referenced: bool,
+}
+
+/// Configuration for the inactivity (motion end) detector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct InactivityConfig {
+    /// 11-bit unsigned threshold the acceleration samples are compared against.
+    pub threshold: u16,
+    /// Inactivity timer value; the resulting time in seconds is `time / ODR`.
+    pub time: u16,
+    /// Compare against a captured reference instead of an absolute value.
+    pub referenced: bool,
+}
+
+/// Selects which STATUS conditions are routed to an interrupt pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub struct InterruptConfig {
+    /// Drive the pin active-low instead of active-high.
+    pub active_low: bool,
+    pub awake: bool,
+    pub act: bool,
+    pub inact: bool,
+    pub data_ready: bool,
+}
+
+impl InterruptConfig {
+    fn bits(self) -> u8 {
+        let mut bits = 0;
+        if self.data_ready {
+            bits |= reg::INTMAP_DATA_READY;
+        }
+        if self.act {
+            bits |= reg::INTMAP_ACT;
+        }
+        if self.inact {
+            bits |= reg::INTMAP_INACT;
+        }
+        if self.awake {
+            bits |= reg::INTMAP_AWAKE;
+        }
+        if self.active_low {
+            bits |= reg::INTMAP_INT_LOW;
+        }
+        bits
+    }
+}
+
 /// Driver for the ADXL362 accelerometer, generic over any `embedded-hal` SPI bus.
 pub struct Adxl362<SPI> {
     spi: SPI,
@@ -197,5 +252,56 @@ where
             act: status & reg::STATUS_ACT != 0,
             inact: status & reg::STATUS_INACT != 0,
         })
+    }
+
+    pub fn configure_activity(&mut self, cfg: &ActivityConfig) -> Result<(), Error<SPI::Error>> {
+        self.write_reg(reg::REG_THRESH_ACT_L, (cfg.threshold & 0xFF) as u8)?;
+        self.write_reg(reg::REG_THRESH_ACT_H, ((cfg.threshold >> 8) & 0x07) as u8)?;
+        self.write_reg(reg::REG_TIME_ACT, cfg.time)?;
+
+        let act_inact_ctl = self.read_reg(reg::REG_ACT_INACT_CTL)?;
+        let mut act_inact_ctl =
+            (act_inact_ctl & !reg::ACT_INACT_CTL_ACT_REF) | reg::ACT_INACT_CTL_ACT_EN;
+        if cfg.referenced {
+            act_inact_ctl |= reg::ACT_INACT_CTL_ACT_REF;
+        }
+        self.write_reg(reg::REG_ACT_INACT_CTL, act_inact_ctl)
+    }
+
+    pub fn configure_inactivity(
+        &mut self,
+        cfg: &InactivityConfig,
+    ) -> Result<(), Error<SPI::Error>> {
+        self.write_reg(reg::REG_THRESH_INACT_L, (cfg.threshold & 0xFF) as u8)?;
+        self.write_reg(reg::REG_THRESH_INACT_H, ((cfg.threshold >> 8) & 0x07) as u8)?;
+        self.write_reg(reg::REG_TIME_INACT_L, (cfg.time & 0xFF) as u8)?;
+        self.write_reg(reg::REG_TIME_INACT_H, ((cfg.time >> 8) & 0xFF) as u8)?;
+
+        let act_inact_ctl = self.read_reg(reg::REG_ACT_INACT_CTL)?;
+        let mut act_inact_ctl =
+            (act_inact_ctl & !reg::ACT_INACT_CTL_INACT_REF) | reg::ACT_INACT_CTL_INACT_EN;
+        if cfg.referenced {
+            act_inact_ctl |= reg::ACT_INACT_CTL_INACT_REF;
+        }
+        self.write_reg(reg::REG_ACT_INACT_CTL, act_inact_ctl)
+    }
+
+    /// Enables linked mode: an activity event arms inactivity detection once,
+    /// and the device returns to standby after the following inactivity event.
+    /// Requires [`Self::configure_activity`] and [`Self::configure_inactivity`]
+    /// to have been called first to enable the respective detectors.
+    pub fn enable_linked_mode(&mut self) -> Result<(), Error<SPI::Error>> {
+        let act_inact_ctl = self.read_reg(reg::REG_ACT_INACT_CTL)?;
+        let act_inact_ctl = (act_inact_ctl & !reg::ACT_INACT_CTL_LINKLOOP_MASK)
+            | reg::ACT_INACT_CTL_LINKLOOP_LINKED;
+        self.write_reg(reg::REG_ACT_INACT_CTL, act_inact_ctl)
+    }
+
+    pub fn configure_interrupt1(&mut self, cfg: &InterruptConfig) -> Result<(), Error<SPI::Error>> {
+        self.write_reg(reg::REG_INTMAP1, cfg.bits())
+    }
+
+    pub fn configure_interrupt2(&mut self, cfg: &InterruptConfig) -> Result<(), Error<SPI::Error>> {
+        self.write_reg(reg::REG_INTMAP2, cfg.bits())
     }
 }
