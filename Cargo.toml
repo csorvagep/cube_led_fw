@@ -24,6 +24,7 @@ esp-backtrace = { version = "0.18.1", features = [
 esp-println = { version = "0.16.1", features = ["defmt-espflash", "esp32c3"] }
 smart-leds = "0.4.0"
 esp-hal-smartled = { version = "0.17.0", features = ["defmt", "esp32c3"] }
+embedded-hal = "1.0.0"
 
 
 [profile.dev]
