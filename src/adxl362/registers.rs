@@ -97,11 +97,13 @@ pub const FILTER_CTL_RANGE_8G: u8 = 2 << 6;
 
 // REG_POWER_CTL bitfield.
 // MEASURE occupies bits [1:0].
+pub const POWER_CTL_MEASURE_MASK: u8 = 0b11;
 pub const POWER_CTL_MEASURE_STANDBY: u8 = 0;
 pub const POWER_CTL_MEASURE_ON: u8 = 0b10;
 pub const POWER_CTL_AUTOSLEEP: u8 = 1 << 2;
 pub const POWER_CTL_WAKEUP: u8 = 1 << 3;
 // LOW_NOISE occupies bits [5:4].
+pub const POWER_CTL_NOISE_MASK: u8 = 0b11 << 4;
 pub const POWER_CTL_NOISE_NORMAL: u8 = 0b00 << 4;
 pub const POWER_CTL_NOISE_LOW: u8 = 0b01 << 4;
 pub const POWER_CTL_NOISE_ULTRALOW: u8 = 0b10 << 4;
