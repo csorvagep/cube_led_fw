@@ -99,4 +99,22 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
     pub fn fill(&mut self, color: RGB8) {
         self.leds.write([color; NUM_LEDS].into_iter()).unwrap();
     }
+
+    /// Fills the cube from accelerometer axis readings (x→R, y→G, z→B).
+    pub fn set_from_acceleration(&mut self, x: i16, y: i16, z: i16) {
+        let color = RGB8 {
+            r: axis_to_channel(x),
+            g: axis_to_channel(y),
+            b: axis_to_channel(z),
+        };
+        self.fill(color);
+    }
+}
+
+// ADXL362 12-bit reading range at +/-2g is approximately -2048..=2047.
+const ACCEL_MAX_MAGNITUDE: u16 = 2048;
+
+fn axis_to_channel(value: i16) -> u8 {
+    let magnitude = value.unsigned_abs().min(ACCEL_MAX_MAGNITUDE);
+    (magnitude as u32 * LEVEL as u32 / ACCEL_MAX_MAGNITUDE as u32) as u8
 }
