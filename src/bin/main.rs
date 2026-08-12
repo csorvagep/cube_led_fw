@@ -7,6 +7,7 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use cubeled::adxl362::{Adxl362, NoiseMode, OutputDataRate, Range};
 use cubeled::led_control::{LedControl, NUM_LEDS, YELLOW};
 use defmt::info;
 use esp_hal::clock::CpuClock;
@@ -52,7 +53,7 @@ fn main() -> ! {
     let leds = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
     let mut led_control = LedControl::new(leds);
 
-    let delay = Delay::new();
+    let mut delay = Delay::new();
 
     let mut button_state = btn.is_high();
 
@@ -66,17 +67,23 @@ fn main() -> ! {
     let sck = peripherals.GPIO0;
     let cs = peripherals.GPIO10;
 
-    let mut spi = Spi::new(peripherals.SPI2, Config::default())
+    let spi = Spi::new(peripherals.SPI2, Config::default())
         .expect("Failed to acquire SPI2")
         .with_mosi(mosi)
         .with_miso(miso)
         .with_sck(sck)
         .with_cs(cs);
 
-    let mut data = [0x0B, 0x2D, 0x00];
-    spi.transfer(&mut data).expect("Failed to transfer data");
-
-    info!("Received data: {}", data[2]);
+    let mut accel = Adxl362::new(spi);
+    accel
+        .init(&mut delay)
+        .expect("Failed to initialize ADXL362");
+    accel
+        .configure_filter(OutputDataRate::Hz100, Range::G2, NoiseMode::Normal)
+        .expect("Failed to configure ADXL362 filter");
+    accel
+        .set_active(true)
+        .expect("Failed to start ADXL362 measurement");
 
     loop {
         let current_btn_state = btn.is_high();
@@ -87,6 +94,15 @@ fn main() -> ! {
             }
         }
         button_state = current_btn_state;
+
+        let acceleration = accel
+            .read_acceleration()
+            .expect("Failed to read acceleration");
+        info!(
+            "Acceleration: x={} y={} z={}",
+            acceleration.x, acceleration.y, acceleration.z
+        );
+        led_control.set_from_acceleration(acceleration.x, acceleration.y, acceleration.z);
 
         delay.delay_millis(100);
     }
