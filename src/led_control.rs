@@ -106,19 +106,18 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
 
     pub async fn fill(&mut self, color: RGB8) {
         self.leds
-            .write([color; NUM_LEDS].into_iter())
+            .write(core::iter::repeat_n(color, NUM_LEDS))
             .await
             .unwrap();
     }
+}
 
-    /// Fills the cube from accelerometer axis readings (x→R, y→G, z→B).
-    pub async fn set_from_acceleration(&mut self, x: i16, y: i16, z: i16) {
-        let color = RGB8 {
-            r: axis_to_channel(x),
-            g: axis_to_channel(y),
-            b: axis_to_channel(z),
-        };
-        self.fill(color).await;
+/// Maps accelerometer axis readings to a fill color (x→R, y→G, z→B).
+pub fn acceleration_to_color(x: i16, y: i16, z: i16) -> RGB8 {
+    RGB8 {
+        r: axis_to_channel(x),
+        g: axis_to_channel(y),
+        b: axis_to_channel(z),
     }
 }
 

@@ -10,10 +10,15 @@
 use cubeled::adxl362::{
     ActivityConfig, Adxl362, InactivityConfig, InterruptConfig, NoiseMode, OutputDataRate, Range,
 };
-use cubeled::led_control::{BLACK, LedControl, NUM_LEDS, YELLOW};
+use cubeled::led_control::{
+    BLACK, LED_BUFFER_SIZE, LedControl, SharedLedControl, YELLOW, acceleration_to_color,
+};
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Ticker, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
@@ -22,19 +27,123 @@ use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal_smartled::{SmartLedsAdapterAsync, buffer_size_async};
+use esp_hal_smartled::SmartLedsAdapterAsync;
+use smart_leds::RGB8;
+use static_cell::StaticCell;
 use {esp_backtrace as _, esp_println as _};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// SPI stays blocking: ADXL362 transfers are tiny (3-8 bytes), not worth a DMA+async rewrite.
+type Accel = Adxl362<Spi<'static, esp_hal::Blocking>>;
+
+// `LedControl` wraps an `esp_hal::Async` RMT channel, which is `!Send`, so it can't live
+// behind a shared `static Mutex`. Instead `led_task` is its sole owner and the other tasks
+// send it commands over this channel.
+enum LedCommand {
+    ButtonPress,
+    Fill(RGB8),
+}
+
+static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
+static LED_BUF: StaticCell<[PulseCode; LED_BUFFER_SIZE]> = StaticCell::new();
+
+// A module boundary is needed here: an `#[allow(clippy::large_stack_frames)]` placed
+// directly on an `#[embassy_executor::task]` fn doesn't reach the coroutine clippy
+// actually measures, since the task macro's expansion doesn't forward it that deep.
+mod led_task_mod {
+    #![allow(
+        clippy::large_stack_frames,
+        reason = "led_task owns the full LED color buffer for its whole lifetime"
+    )]
+
+    use defmt::info;
+
+    use super::{LedCommand, SharedLedControl};
+
+    #[embassy_executor::task]
+    pub async fn led_task(mut led_control: SharedLedControl) {
+        loop {
+            match super::LED_CHANNEL.receive().await {
+                LedCommand::ButtonPress => {
+                    led_control.on_button_press().await;
+                    info!("Button pressed");
+                }
+                LedCommand::Fill(color) => led_control.fill(color).await,
+            }
+        }
+    }
+}
+use led_task_mod::led_task;
+
+#[embassy_executor::task]
+async fn button_task(mut btn: Input<'static>) {
+    loop {
+        btn.wait_for_any_edge().await;
+        if !btn.is_high() {
+            LED_CHANNEL.send(LedCommand::ButtonPress).await;
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
+    // Number of 100ms ticks the LEDs stay off after inactivity is detected.
+    const INACTIVITY_OFF_TICKS: u32 = 10_000 / 100;
+    let mut leds_off = false;
+    let mut inactivity_ticks: Option<u32> = None;
+    let mut ticker = Ticker::every(Duration::from_millis(100));
+
+    loop {
+        match select(adxl_int2.wait_for_rising_edge(), ticker.next()).await {
+            Either::First(()) => {
+                let status = accel.read_status().expect("Failed to read ADXL362 status");
+                if status.act {
+                    info!("Activity detected");
+                    leds_off = false;
+                    inactivity_ticks = None;
+                }
+                if status.inact {
+                    info!("Inactivity detected");
+                    inactivity_ticks = Some(INACTIVITY_OFF_TICKS);
+                }
+            }
+            Either::Second(()) => {
+                if let Some(ticks) = inactivity_ticks {
+                    if ticks == 0 {
+                        leds_off = true;
+                        inactivity_ticks = None;
+                    } else {
+                        inactivity_ticks = Some(ticks - 1);
+                    }
+                }
+
+                let color = if leds_off {
+                    BLACK
+                } else {
+                    let acceleration = accel
+                        .read_acceleration()
+                        .expect("Failed to read acceleration");
+                    info!(
+                        "Acceleration: x={} y={} z={}",
+                        acceleration.x, acceleration.y, acceleration.z
+                    );
+                    acceleration_to_color(acceleration.x, acceleration.y, acceleration.z)
+                };
+                LED_CHANNEL.send(LedCommand::Fill(color)).await;
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 #[esp_rtos::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
@@ -63,13 +172,9 @@ async fn main(_spawner: Spawner) {
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
         .unwrap()
         .into_async();
-    let mut led_buffer = [PulseCode::default(); buffer_size_async(NUM_LEDS)];
-    let leds = SmartLedsAdapterAsync::new(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
+    let led_buffer = LED_BUF.init([PulseCode::default(); LED_BUFFER_SIZE]);
+    let leds = SmartLedsAdapterAsync::new(rmt.channel0, peripherals.GPIO8, led_buffer);
     let mut led_control = LedControl::new(leds).await;
-
-    let mut delay = Delay::new();
-
-    let mut button_state = btn.is_high();
 
     info!("CubeLED started");
     info!("Filling cube with color YELLOW");
@@ -88,6 +193,7 @@ async fn main(_spawner: Spawner) {
         .with_sck(sck)
         .with_cs(cs);
 
+    let mut delay = Delay::new();
     let mut accel = Adxl362::new(spi);
     accel
         .init(&mut delay)
@@ -125,58 +231,11 @@ async fn main(_spawner: Spawner) {
         .set_active(true)
         .expect("Failed to start ADXL362 measurement");
 
-    // Number of 100ms loop iterations the LEDs stay off after inactivity is detected.
-    const INACTIVITY_OFF_TICKS: u32 = 10_000 / 100;
-    let mut leds_off = false;
-    let mut inactivity_ticks: Option<u32> = None;
+    spawner.spawn(led_task(led_control)).unwrap();
+    spawner.spawn(button_task(btn)).unwrap();
+    spawner.spawn(sensor_task(adxl_int2, accel)).unwrap();
 
     loop {
-        let current_btn_state = btn.is_high();
-        if button_state != current_btn_state {
-            if !current_btn_state {
-                led_control.on_button_press().await;
-                info!("Button pressed");
-            }
-        }
-        button_state = current_btn_state;
-
-        if adxl_int2.is_high() {
-            let status = accel.read_status().expect("Failed to read ADXL362 status");
-            if status.act {
-                info!("Activity detected");
-                leds_off = false;
-                inactivity_ticks = None;
-            }
-            if status.inact {
-                info!("Inactivity detected");
-                inactivity_ticks = Some(INACTIVITY_OFF_TICKS);
-            }
-        }
-
-        if let Some(ticks) = inactivity_ticks {
-            if ticks == 0 {
-                leds_off = true;
-                inactivity_ticks = None;
-            } else {
-                inactivity_ticks = Some(ticks - 1);
-            }
-        }
-
-        if leds_off {
-            led_control.fill(BLACK).await;
-        } else {
-            let acceleration = accel
-                .read_acceleration()
-                .expect("Failed to read acceleration");
-            info!(
-                "Acceleration: x={} y={} z={}",
-                acceleration.x, acceleration.y, acceleration.z
-            );
-            led_control
-                .set_from_acceleration(acceleration.x, acceleration.y, acceleration.z)
-                .await;
-        }
-
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_secs(3600)).await;
     }
 }
