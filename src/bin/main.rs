@@ -12,14 +12,17 @@ use cubeled::adxl362::{
 };
 use cubeled::led_control::{BLACK, LedControl, NUM_LEDS, YELLOW};
 use defmt::info;
+use embassy_executor::Spawner;
+use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
-use esp_hal::main;
-use esp_hal::rmt::Rmt;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
+use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
-use esp_hal_smartled::{SmartLedsAdapter, smart_led_buffer};
+use esp_hal::timer::timg::TimerGroup;
+use esp_hal_smartled::{SmartLedsAdapterAsync, buffer_size_async};
 use {esp_backtrace as _, esp_println as _};
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -30,10 +33,14 @@ esp_bootloader_esp_idf::esp_app_desc!();
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
-#[main]
-fn main() -> ! {
+#[esp_rtos::main]
+async fn main(_spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
+
+    let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let timg0 = TimerGroup::new(peripherals.TIMG0);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
     // LD_ON pin
     let mut ld_on = Output::new(
@@ -53,10 +60,12 @@ fn main() -> ! {
     let adxl_int2 = Input::new(peripherals.GPIO4, InputConfig::default());
 
     // LED driver
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
-    let mut led_buffer = smart_led_buffer!(NUM_LEDS);
-    let leds = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
-    let mut led_control = LedControl::new(leds);
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
+        .unwrap()
+        .into_async();
+    let mut led_buffer = [PulseCode::default(); buffer_size_async(NUM_LEDS)];
+    let leds = SmartLedsAdapterAsync::new(rmt.channel0, peripherals.GPIO8, &mut led_buffer);
+    let mut led_control = LedControl::new(leds).await;
 
     let mut delay = Delay::new();
 
@@ -64,7 +73,7 @@ fn main() -> ! {
 
     info!("CubeLED started");
     info!("Filling cube with color YELLOW");
-    led_control.fill(YELLOW);
+    led_control.fill(YELLOW).await;
 
     // SPI
     let mosi = peripherals.GPIO3;
@@ -125,7 +134,7 @@ fn main() -> ! {
         let current_btn_state = btn.is_high();
         if button_state != current_btn_state {
             if !current_btn_state {
-                led_control.on_button_press();
+                led_control.on_button_press().await;
                 info!("Button pressed");
             }
         }
@@ -154,7 +163,7 @@ fn main() -> ! {
         }
 
         if leds_off {
-            led_control.fill(BLACK);
+            led_control.fill(BLACK).await;
         } else {
             let acceleration = accel
                 .read_acceleration()
@@ -163,9 +172,11 @@ fn main() -> ! {
                 "Acceleration: x={} y={} z={}",
                 acceleration.x, acceleration.y, acceleration.z
             );
-            led_control.set_from_acceleration(acceleration.x, acceleration.y, acceleration.z);
+            led_control
+                .set_from_acceleration(acceleration.x, acceleration.y, acceleration.z)
+                .await;
         }
 
-        delay.delay_millis(100);
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
