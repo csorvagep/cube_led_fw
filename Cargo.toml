@@ -1,8 +1,8 @@
 [package]
-edition      = "2024"
-name         = "cubeled"
+edition = "2024"
+name = "cubeled"
 rust-version = "1.88"
-version      = "0.1.0"
+version = "0.1.0"
 
 [[bin]]
 name = "cubeled"
@@ -12,7 +12,7 @@ path = "./src/bin/main.rs"
 esp-hal = { version = "~1.0", features = ["defmt", "esp32c3", "unstable"] }
 
 
-defmt                  = "1.0.1"
+defmt = "1.0.1"
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c3"] }
 
 critical-section = "1.2.0"
@@ -25,6 +25,12 @@ esp-println = { version = "0.16.1", features = ["defmt-espflash", "esp32c3"] }
 smart-leds = "0.4.0"
 esp-hal-smartled = { version = "0.17.0", features = ["defmt", "esp32c3"] }
 embedded-hal = "1.0.0"
+embassy-executor = "0.9"
+embassy-time = "0.5"
+embassy-futures = "0.1"
+embassy-sync = "0.7"
+static_cell = "2"
+esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "defmt"] }
 
 
 [profile.dev]
@@ -33,10 +39,10 @@ embedded-hal = "1.0.0"
 opt-level = "s"
 
 [profile.release]
-codegen-units    = 1     # LLVM can perform better optimizations using a single thread
-debug            = 2
+codegen-units = 1        # LLVM can perform better optimizations using a single thread
+debug = 2
 debug-assertions = false
-incremental      = false
-lto              = 'fat'
-opt-level        = 's'
-overflow-checks  = false
+incremental = false
+lto = 'fat'
+opt-level = 's'
+overflow-checks = false
