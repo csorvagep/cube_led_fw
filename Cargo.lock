@@ -59,6 +59,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "color8"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea3ab4a9ff5b0dd0b96efd6cab14fa53b93e5be16290ec4a00648fa5111038cc"
+dependencies = [
+ "lib8tion",
+]
+
+[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,6 +87,7 @@ dependencies = [
 name = "cubeled"
 version = "0.1.0"
 dependencies = [
+ "color8",
  "critical-section",
  "defmt 1.0.1",
  "embassy-executor",
@@ -966,6 +976,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "lib8tion"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f21e4b357d0ace305f658e4e00dffd3e9195eb478f1e59adf98f37021ffbb1f"
 
 [[package]]
 name = "litrs"
