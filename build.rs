@@ -1,8 +1,12 @@
 fn main() {
-    linker_be_nice();
-    println!("cargo:rustc-link-arg=-Tdefmt.x");
-    // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
-    println!("cargo:rustc-link-arg=-Tlinkall.x");
+    // These linker scripts only exist for the embedded (esp32c3) build; skip them on the host
+    // so `cargo test` can link a normal test binary.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("riscv32") {
+        linker_be_nice();
+        println!("cargo:rustc-link-arg=-Tdefmt.x");
+        // make sure linkall.x is the last linker script (otherwise might cause problems with flip-link)
+        println!("cargo:rustc-link-arg=-Tlinkall.x");
+    }
 }
 
 fn linker_be_nice() {

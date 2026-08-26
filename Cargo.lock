@@ -101,6 +101,7 @@ dependencies = [
  "esp-hal-smartled",
  "esp-println",
  "esp-rtos",
+ "lib8tion",
  "smart-leds",
  "static_cell",
 ]

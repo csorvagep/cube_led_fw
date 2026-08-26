@@ -9,13 +9,21 @@ name = "cubeled"
 path = "./src/bin/main.rs"
 
 [dependencies]
-esp-hal = { version = "~1.0", features = ["defmt", "esp32c3", "unstable"] }
-
-
 defmt = "1.0.1"
-esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c3"] }
-
 critical-section = "1.2.0"
+embedded-hal = "1.0.0"
+
+# Enabled by the host unit-test build only (see .vscode/settings.json runnables.extraArgs
+# and .cargo/config.toml); switches src/lib.rs off `no_std` so `cargo test` can link std.
+[features]
+std = []
+
+# Hardware-specific crates only build for the esp32c3 target, so they're kept out of the
+# default host build. This lets `cargo test --lib --target <host-triple>` run unit tests
+# (e.g. layout3d) without needing the embedded toolchain.
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+esp-hal = { version = "~1.0", features = ["defmt", "esp32c3", "unstable"] }
+esp-bootloader-esp-idf = { version = "0.4.0", features = ["defmt", "esp32c3"] }
 esp-backtrace = { version = "0.18.1", features = [
   "defmt",
   "esp32c3",
@@ -25,7 +33,7 @@ esp-println = { version = "0.16.1", features = ["defmt-espflash", "esp32c3"] }
 smart-leds = "0.4.0"
 esp-hal-smartled = { version = "0.17.0", features = ["defmt", "esp32c3"] }
 color8 = "0.1.0"
-embedded-hal = "1.0.0"
+lib8tion = "0.1"
 embassy-executor = "0.9"
 embassy-time = "0.5"
 embassy-futures = "0.1"

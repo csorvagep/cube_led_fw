@@ -40,7 +40,7 @@ type Accel = Adxl362<Spi<'static, esp_hal::Blocking>>;
 // behind a shared `static Mutex`. Instead `led_task` is its sole owner and the other tasks
 // send it commands over this channel.
 enum LedCommand {
-    ToggleEnabled,
+    NextEffect,
     SetEnabled(bool),
 }
 
@@ -60,22 +60,54 @@ mod led_task_mod {
     use embassy_futures::select::{Either, select};
     use embassy_time::{Duration, Ticker};
 
+    use crate::led_task_mod::Effect::LarsonScanner;
+
     use super::{LedCommand, SharedLedControl};
 
-    const SCANNER_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+    const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Effect {
+        Palette,
+        Rainbow,
+        LarsonScanner,
+        Off,
+    }
+
+    impl Effect {
+        fn next(self) -> Self {
+            match self {
+                Effect::Palette => Effect::Rainbow,
+                Effect::Rainbow => Effect::LarsonScanner,
+                Effect::LarsonScanner => Effect::Off,
+                Effect::Off => Effect::Palette,
+            }
+        }
+    }
 
     #[embassy_executor::task]
     pub async fn led_task(mut led_control: SharedLedControl) {
-        let mut ticker = Ticker::every(SCANNER_FRAME_INTERVAL);
+        let mut ticker = Ticker::every(FRAME_INTERVAL);
+        let mut effect = Effect::Palette;
         let mut enabled = true;
         loop {
-            // While enabled, keep rendering scanner frames but stay ready to drop out the
-            // moment another command (toggle, activity change, ...) comes in.
-            let command = if enabled {
+            // While running, keep rendering frames but stay ready to drop out the moment
+            // another command (next effect, activity change, ...) comes in.
+            let running = enabled && effect != Effect::Off;
+            let command = if running {
                 match select(super::LED_CHANNEL.receive(), ticker.next()).await {
                     Either::First(command) => command,
                     Either::Second(()) => {
-                        led_control.larson_scanner_frame().await;
+                        match effect {
+                            Effect::Palette => led_control.palette_frame().await,
+                            Effect::Rainbow => {
+                                led_control
+                                    .rainbow_frame(embassy_time::Instant::now().as_millis())
+                                    .await
+                            }
+                            Effect::LarsonScanner => led_control.larson_scanner_frame().await,
+                            Effect::Off => {}
+                        }
                         continue;
                     }
                 }
@@ -84,25 +116,24 @@ mod led_task_mod {
             };
 
             match command {
-                LedCommand::ToggleEnabled => {
-                    enabled = !enabled;
-                    info!("LEDs enabled: {}", enabled);
-                    if enabled {
-                        // The ticker fell behind while disabled and would otherwise fire in a
-                        // burst to catch up, making the scanner briefly run too fast.
-                        ticker.reset();
-                    } else {
-                        led_control.fill(super::BLACK).await;
+                LedCommand::NextEffect => {
+                    effect = effect.next();
+                    match effect {
+                        Effect::Palette => info!("Effect: palette"),
+                        Effect::Rainbow => info!("Effect: rainbow"),
+                        Effect::LarsonScanner => info!("Effect: larson scanner"),
+                        Effect::Off => info!("Effect: off"),
                     }
                 }
-                LedCommand::SetEnabled(new_enabled) => {
-                    enabled = new_enabled;
-                    if enabled {
-                        ticker.reset();
-                    } else {
-                        led_control.fill(super::BLACK).await;
-                    }
-                }
+                LedCommand::SetEnabled(new_enabled) => enabled = new_enabled,
+            }
+
+            if enabled && effect != Effect::Off {
+                // The ticker fell behind while paused and would otherwise fire in a burst to
+                // catch up, making the next effect briefly run too fast.
+                ticker.reset();
+            } else {
+                led_control.fill(super::BLACK).await;
             }
         }
     }
@@ -114,7 +145,7 @@ async fn button_task(mut btn: Input<'static>) {
     loop {
         btn.wait_for_any_edge().await;
         if !btn.is_high() {
-            LED_CHANNEL.send(LedCommand::ToggleEnabled).await;
+            LED_CHANNEL.send(LedCommand::NextEffect).await;
         }
     }
 }
