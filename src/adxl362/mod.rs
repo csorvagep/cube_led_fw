@@ -193,6 +193,10 @@ where
 
     /// Soft-resets the device and verifies its identification registers.
     pub fn init(&mut self, delay: &mut impl DelayNs) -> Result<(), Error<SPI::Error>> {
+        // Force standby first: on a warm MCU reboot the ADXL362 may still be
+        // mid-conversion from the previous session, which can desync the SPI
+        // framing of the soft-reset command that follows.
+        self.write_reg(reg::REG_POWER_CTL, reg::POWER_CTL_MEASURE_STANDBY)?;
         self.write_reg(reg::REG_SOFT_RESET, reg::SOFT_RESET_KEY)?;
         // Datasheet: allow 500us for the reset to complete before further access.
         delay.delay_us(500);

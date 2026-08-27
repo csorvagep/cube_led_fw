@@ -10,9 +10,7 @@
 use cubeled::adxl362::{
     ActivityConfig, Adxl362, InactivityConfig, InterruptConfig, NoiseMode, OutputDataRate, Range,
 };
-use cubeled::led_control::{
-    BLACK, LED_BUFFER_SIZE, LedControl, SharedLedControl, YELLOW, acceleration_to_color,
-};
+use cubeled::led_control::{BLACK, LED_BUFFER_SIZE, LedControl, SharedLedControl, YELLOW};
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -28,7 +26,6 @@ use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::SmartLedsAdapterAsync;
-use smart_leds::RGB8;
 use static_cell::StaticCell;
 use {esp_backtrace as _, esp_println as _};
 
@@ -43,8 +40,8 @@ type Accel = Adxl362<Spi<'static, esp_hal::Blocking>>;
 // behind a shared `static Mutex`. Instead `led_task` is its sole owner and the other tasks
 // send it commands over this channel.
 enum LedCommand {
-    ButtonPress,
-    Fill(RGB8),
+    NextEffect,
+    SetEnabled(bool),
 }
 
 static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
@@ -60,18 +57,83 @@ mod led_task_mod {
     )]
 
     use defmt::info;
+    use embassy_futures::select::{Either, select};
+    use embassy_time::{Duration, Ticker};
+
+    use crate::led_task_mod::Effect::LarsonScanner;
 
     use super::{LedCommand, SharedLedControl};
 
+    const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Effect {
+        Palette,
+        Rainbow,
+        LarsonScanner,
+        Off,
+    }
+
+    impl Effect {
+        fn next(self) -> Self {
+            match self {
+                Effect::Palette => Effect::Rainbow,
+                Effect::Rainbow => Effect::LarsonScanner,
+                Effect::LarsonScanner => Effect::Off,
+                Effect::Off => Effect::Palette,
+            }
+        }
+    }
+
     #[embassy_executor::task]
     pub async fn led_task(mut led_control: SharedLedControl) {
+        let mut ticker = Ticker::every(FRAME_INTERVAL);
+        let mut effect = Effect::Palette;
+        let mut enabled = true;
         loop {
-            match super::LED_CHANNEL.receive().await {
-                LedCommand::ButtonPress => {
-                    led_control.on_button_press().await;
-                    info!("Button pressed");
+            // While running, keep rendering frames but stay ready to drop out the moment
+            // another command (next effect, activity change, ...) comes in.
+            let running = enabled && effect != Effect::Off;
+            let command = if running {
+                match select(super::LED_CHANNEL.receive(), ticker.next()).await {
+                    Either::First(command) => command,
+                    Either::Second(()) => {
+                        match effect {
+                            Effect::Palette => led_control.palette_frame().await,
+                            Effect::Rainbow => {
+                                led_control
+                                    .rainbow_frame(embassy_time::Instant::now().as_millis())
+                                    .await
+                            }
+                            Effect::LarsonScanner => led_control.larson_scanner_frame().await,
+                            Effect::Off => {}
+                        }
+                        continue;
+                    }
                 }
-                LedCommand::Fill(color) => led_control.fill(color).await,
+            } else {
+                super::LED_CHANNEL.receive().await
+            };
+
+            match command {
+                LedCommand::NextEffect => {
+                    effect = effect.next();
+                    match effect {
+                        Effect::Palette => info!("Effect: palette"),
+                        Effect::Rainbow => info!("Effect: rainbow"),
+                        Effect::LarsonScanner => info!("Effect: larson scanner"),
+                        Effect::Off => info!("Effect: off"),
+                    }
+                }
+                LedCommand::SetEnabled(new_enabled) => enabled = new_enabled,
+            }
+
+            if enabled && effect != Effect::Off {
+                // The ticker fell behind while paused and would otherwise fire in a burst to
+                // catch up, making the next effect briefly run too fast.
+                ticker.reset();
+            } else {
+                led_control.fill(super::BLACK).await;
             }
         }
     }
@@ -83,16 +145,15 @@ async fn button_task(mut btn: Input<'static>) {
     loop {
         btn.wait_for_any_edge().await;
         if !btn.is_high() {
-            LED_CHANNEL.send(LedCommand::ButtonPress).await;
+            LED_CHANNEL.send(LedCommand::NextEffect).await;
         }
     }
 }
 
 #[embassy_executor::task]
 async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
-    // Number of 100ms ticks the LEDs stay off after inactivity is detected.
+    // Number of 100ms ticks of continued inactivity before the LEDs turn off.
     const INACTIVITY_OFF_TICKS: u32 = 10_000 / 100;
-    let mut leds_off = false;
     let mut inactivity_ticks: Option<u32> = None;
     let mut ticker = Ticker::every(Duration::from_millis(100));
 
@@ -102,8 +163,8 @@ async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
                 let status = accel.read_status().expect("Failed to read ADXL362 status");
                 if status.act {
                     info!("Activity detected");
-                    leds_off = false;
                     inactivity_ticks = None;
+                    LED_CHANNEL.send(LedCommand::SetEnabled(true)).await;
                 }
                 if status.inact {
                     info!("Inactivity detected");
@@ -113,26 +174,12 @@ async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
             Either::Second(()) => {
                 if let Some(ticks) = inactivity_ticks {
                     if ticks == 0 {
-                        leds_off = true;
                         inactivity_ticks = None;
+                        LED_CHANNEL.send(LedCommand::SetEnabled(false)).await;
                     } else {
                         inactivity_ticks = Some(ticks - 1);
                     }
                 }
-
-                let color = if leds_off {
-                    BLACK
-                } else {
-                    let acceleration = accel
-                        .read_acceleration()
-                        .expect("Failed to read acceleration");
-                    info!(
-                        "Acceleration: x={} y={} z={}",
-                        acceleration.x, acceleration.y, acceleration.z
-                    );
-                    acceleration_to_color(acceleration.x, acceleration.y, acceleration.z)
-                };
-                LED_CHANNEL.send(LedCommand::Fill(color)).await;
             }
         }
     }
