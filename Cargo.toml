@@ -38,8 +38,11 @@ embassy-executor = "0.9"
 embassy-time = "0.5"
 embassy-futures = "0.1"
 embassy-sync = "0.7"
+embassy-net = { version = "0.7", features = ["defmt", "dhcpv4", "medium-ethernet", "tcp"] }
 static_cell = "2"
-esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "defmt"] }
+esp-alloc = "0.9"
+esp-radio = { version = "0.17", features = ["defmt", "esp32c3", "wifi"] }
+esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "defmt", "esp-radio"] }
 
 
 [profile.dev]

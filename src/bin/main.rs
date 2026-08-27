@@ -7,6 +7,8 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::net::Ipv4Addr;
+
 use cubeled::adxl362::{
     ActivityConfig, Adxl362, InactivityConfig, InterruptConfig, NoiseMode, OutputDataRate, Range,
 };
@@ -14,20 +16,29 @@ use cubeled::led_control::{BLACK, LED_BUFFER_SIZE, LedControl, SharedLedControl,
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
+use embassy_net::{ConfigV4, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Duration, Ticker, Timer};
+use embassy_time::{Duration, Ticker, Timer, with_timeout};
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::{PulseCode, Rmt};
+use esp_hal::rng::Rng;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal_smartled::SmartLedsAdapterAsync;
+use esp_radio::Controller;
+use esp_radio::wifi::{
+    ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
+};
 use static_cell::StaticCell;
 use {esp_backtrace as _, esp_println as _};
+
+#[path = "secrets/wifi_secrets.rs"]
+mod wifi_secrets;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -46,6 +57,14 @@ enum LedCommand {
 
 static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
 static LED_BUF: StaticCell<[PulseCode; LED_BUFFER_SIZE]> = StaticCell::new();
+
+static ESP_RADIO_CTRL: StaticCell<Controller<'static>> = StaticCell::new();
+static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+
+// Used only if no DHCP lease shows up within `DHCP_TIMEOUT` (e.g. an AP with no DHCP server).
+const STATIC_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 137, 50);
+const STATIC_GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 137, 1);
+const DHCP_TIMEOUT: Duration = Duration::from_secs(10);
 
 // A module boundary is needed here: an `#[allow(clippy::large_stack_frames)]` placed
 // directly on an `#[embassy_executor::task]` fn doesn't reach the coroutine clippy
@@ -185,6 +204,43 @@ async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
     }
 }
 
+#[embassy_executor::task]
+async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
+    runner.run().await
+}
+
+#[embassy_executor::task]
+async fn wifi_task(mut controller: WifiController<'static>) {
+    loop {
+        if esp_radio::wifi::sta_state() == WifiStaState::Connected {
+            // Already connected; wait here until we drop off before trying again.
+            controller.wait_for_event(WifiEvent::StaDisconnected).await;
+            info!("Wifi disconnected");
+            Timer::after(Duration::from_secs(5)).await;
+        }
+
+        if !matches!(controller.is_started(), Ok(true)) {
+            let client_config = ModeConfig::Client(
+                ClientConfig::default()
+                    .with_ssid(wifi_secrets::SSID.into())
+                    .with_password(wifi_secrets::PASSWORD.into()),
+            );
+            controller.set_config(&client_config).unwrap();
+            info!("Starting wifi");
+            controller.start_async().await.unwrap();
+        }
+
+        info!("Connecting to wifi...");
+        match controller.connect_async().await {
+            Ok(()) => info!("Wifi connected"),
+            Err(_) => {
+                info!("Failed to connect to wifi, retrying");
+                Timer::after(Duration::from_secs(5)).await;
+            }
+        }
+    }
+}
+
 #[allow(
     clippy::large_stack_frames,
     reason = "it's not unusual to allocate larger buffers etc. in main"
@@ -194,9 +250,30 @@ async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
 
+    esp_alloc::heap_allocator!(size: 64 * 1024);
+
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+
+    let esp_radio_ctrl: &'static Controller<'static> =
+        &*ESP_RADIO_CTRL.init(esp_radio::init().unwrap());
+    let (wifi_controller, wifi_interfaces) =
+        esp_radio::wifi::new(esp_radio_ctrl, peripherals.WIFI, Default::default()).unwrap();
+
+    let net_seed = {
+        let rng = Rng::new();
+        (rng.random() as u64) << 32 | rng.random() as u64
+    };
+    let (net_stack, net_runner) = embassy_net::new(
+        wifi_interfaces.sta,
+        embassy_net::Config::dhcpv4(Default::default()),
+        NET_RESOURCES.init(StackResources::new()),
+        net_seed,
+    );
+
+    spawner.spawn(net_task(net_runner)).unwrap();
+    spawner.spawn(wifi_task(wifi_controller)).unwrap();
 
     // LD_ON pin
     let mut ld_on = Output::new(
@@ -281,6 +358,34 @@ async fn main(spawner: Spawner) {
     spawner.spawn(led_task(led_control)).unwrap();
     spawner.spawn(button_task(btn)).unwrap();
     spawner.spawn(sensor_task(adxl_int2, accel)).unwrap();
+
+    info!("Waiting for wifi link...");
+    while !net_stack.is_link_up() {
+        Timer::after(Duration::from_millis(500)).await;
+    }
+
+    info!("Waiting for IP address (DHCP)...");
+    let dhcp_config = with_timeout(DHCP_TIMEOUT, async {
+        loop {
+            if let Some(config) = net_stack.config_v4() {
+                return config;
+            }
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    })
+    .await;
+    match dhcp_config {
+        Ok(config) => info!("Got IP via DHCP: {}", config.address),
+        Err(_) => {
+            info!("No DHCP lease after {}s, falling back to static IP", DHCP_TIMEOUT.as_secs());
+            net_stack.set_config_v4(ConfigV4::Static(StaticConfigV4 {
+                address: Ipv4Cidr::new(STATIC_IP, 24),
+                gateway: Some(STATIC_GATEWAY),
+                dns_servers: Default::default(),
+            }));
+            info!("Using static IP: {}", STATIC_IP);
+        }
+    }
 
     loop {
         Timer::after(Duration::from_secs(3600)).await;

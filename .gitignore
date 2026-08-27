@@ -24,3 +24,6 @@ target/
 
 # Ignore .DS_Store file in mac
 **/.DS_Store
+
+# Wi-Fi credentials (copy wifi_secrets.rs.example to wifi_secrets.rs and fill in real values)
+src/bin/secrets/wifi_secrets.rs
