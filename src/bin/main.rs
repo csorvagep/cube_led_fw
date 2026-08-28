@@ -16,8 +16,8 @@ use cubeled::led_control::{BLACK, LED_BUFFER_SIZE, LedControl, SharedLedControl,
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
-use embassy_net::{ConfigV4, IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_net::tcp::TcpSocket;
+use embassy_net::{ConfigV4, IpListenEndpoint, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Ticker, Timer, with_timeout};
@@ -36,7 +36,7 @@ use esp_hal::spi::master::{Config, Spi};
 use esp_hal::system::software_reset;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
-use esp_hal_smartled::SmartLedsAdapterAsync;
+use esp_hal_smartled::SmartLedsAdapter;
 use esp_radio::Controller;
 use esp_radio::wifi::{
     ClientConfig, ModeConfig, WifiController, WifiDevice, WifiEvent, WifiStaState,
@@ -55,9 +55,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // SPI stays blocking: ADXL362 transfers are tiny (3-8 bytes), not worth a DMA+async rewrite.
 type Accel = Adxl362<Spi<'static, esp_hal::Blocking>>;
 
-// `LedControl` wraps an `esp_hal::Async` RMT channel, which is `!Send`, so it can't live
-// behind a shared `static Mutex`. Instead `led_task` is its sole owner and the other tasks
-// send it commands over this channel.
+// `led_task` is the sole owner of `LedControl`; other tasks send it commands over this
+// channel instead of sharing it behind a mutex.
 enum LedCommand {
     NextEffect,
     SetEnabled(bool),
@@ -117,7 +116,7 @@ mod led_task_mod {
     #[embassy_executor::task]
     pub async fn led_task(mut led_control: SharedLedControl) {
         let mut ticker = Ticker::every(FRAME_INTERVAL);
-        let mut effect = Effect::Palette;
+        let mut effect = Effect::LarsonScanner;
         let mut enabled = true;
         loop {
             // While running, keep rendering frames but stay ready to drop out the moment
@@ -128,13 +127,11 @@ mod led_task_mod {
                     Either::First(command) => command,
                     Either::Second(()) => {
                         match effect {
-                            Effect::Palette => led_control.palette_frame().await,
+                            Effect::Palette => led_control.palette_frame(),
                             Effect::Rainbow => {
-                                led_control
-                                    .rainbow_frame(embassy_time::Instant::now().as_millis())
-                                    .await
+                                led_control.rainbow_frame(embassy_time::Instant::now().as_millis())
                             }
-                            Effect::LarsonScanner => led_control.larson_scanner_frame().await,
+                            Effect::LarsonScanner => led_control.larson_scanner_frame(),
                             Effect::Off => {}
                         }
                         continue;
@@ -162,7 +159,7 @@ mod led_task_mod {
                 // catch up, making the next effect briefly run too fast.
                 ticker.reset();
             } else {
-                led_control.fill(super::BLACK).await;
+                led_control.fill(super::BLACK);
             }
         }
     }
@@ -401,16 +398,14 @@ async fn main(spawner: Spawner) {
     let adxl_int2 = Input::new(peripherals.GPIO4, InputConfig::default());
 
     // LED driver
-    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80))
-        .unwrap()
-        .into_async();
+    let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
     let led_buffer = LED_BUF.init([PulseCode::default(); LED_BUFFER_SIZE]);
-    let leds = SmartLedsAdapterAsync::new(rmt.channel0, peripherals.GPIO8, led_buffer);
-    let mut led_control = LedControl::new(leds).await;
+    let leds = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, led_buffer);
+    let mut led_control = LedControl::new(leds);
 
     info!("CubeLED started");
     info!("Filling cube with color YELLOW");
-    led_control.fill(YELLOW).await;
+    led_control.fill(YELLOW);
 
     // SPI
     let mosi = peripherals.GPIO3;

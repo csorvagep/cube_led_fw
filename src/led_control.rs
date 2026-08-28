@@ -2,9 +2,9 @@ use color8::palette::{ColorBlend, color_from_palette16};
 use color8::presets::RAINBOW_COLORS;
 use color8::rgb::Crgb;
 use color8::{Chsv, fade_to_black_by, nscale8};
-use esp_hal_smartled::{SmartLedsAdapterAsync, buffer_size_async};
+use esp_hal_smartled::{SmartLedsAdapter, buffer_size};
 use lib8tion::{cos16, sin16};
-use smart_leds::{RGB8, SmartLedsWriteAsync as _};
+use smart_leds::{RGB8, SmartLedsWrite as _};
 
 use crate::layout3d::{CubeFaces, Layout3d};
 use crate::vec3::Vec3;
@@ -13,7 +13,14 @@ pub const NUM_LEDS: usize = 150;
 
 // Hoisted out of the generic impl below: rustc rejects associated consts in
 // a `[T; N]` array-length position inside `impl<const BUFFER_SIZE: usize>`.
-pub const LED_BUFFER_SIZE: usize = buffer_size_async(NUM_LEDS);
+//
+// Uses the *blocking* adapter's sizing/API rather than the async one: the async adapter
+// transmits one LED at a time as separate awaited RMT operations, leaving the line idle
+// between each `.await` point for however long the executor takes to resume it. With Wi-Fi
+// tasks in the mix that gap can stretch past the WS2812 reset threshold and corrupt the
+// display. The blocking adapter issues a single continuous RMT transmission for the whole
+// frame, so there's no such gap (a `led_task` iteration blocks briefly, but that's fine).
+pub const LED_BUFFER_SIZE: usize = buffer_size(NUM_LEDS);
 pub type SharedLedControl = LedControl<'static, LED_BUFFER_SIZE>;
 
 const COLS: usize = 5;
@@ -79,7 +86,7 @@ fn meander_index(logical: usize) -> usize {
 }
 
 pub struct LedControl<'a, const BUFFER_SIZE: usize> {
-    leds: SmartLedsAdapterAsync<'a, BUFFER_SIZE>,
+    leds: SmartLedsAdapter<'a, BUFFER_SIZE>,
     led_colors: [RGB8; NUM_LEDS],
     scanner_trail: [Crgb; NUM_LEDS],
     scanner_pos: usize,
@@ -89,9 +96,9 @@ pub struct LedControl<'a, const BUFFER_SIZE: usize> {
 }
 
 impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
-    pub async fn new(mut leds: SmartLedsAdapterAsync<'a, BUFFER_SIZE>) -> Self {
+    pub fn new(mut leds: SmartLedsAdapter<'a, BUFFER_SIZE>) -> Self {
         let led_colors = [RGB8::default(); NUM_LEDS];
-        leds.write(led_colors.iter().copied()).await.unwrap();
+        leds.write(led_colors.iter().copied()).unwrap();
         Self {
             leds,
             led_colors,
@@ -103,17 +110,16 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
         }
     }
 
-    pub async fn fill(&mut self, color: RGB8) {
+    pub fn fill(&mut self, color: RGB8) {
         self.leds
             .write(core::iter::repeat_n(color, NUM_LEDS))
-            .await
             .unwrap();
     }
 
     /// Renders one frame of a Larson-scanner ("Knight Rider") sweep: a bright dot bounces
     /// end to end across the strip, leaving a fading trail. The dot advances by one LED per
     /// call, so the sweep speed is entirely up to how often the caller calls this.
-    pub async fn larson_scanner_frame(&mut self) {
+    pub fn larson_scanner_frame(&mut self) {
         fade_to_black_by(&mut self.scanner_trail, SCANNER_FADE_BY);
 
         self.scanner_trail[meander_index(self.scanner_pos)] =
@@ -146,14 +152,13 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
         }
         self.leds
             .write(self.led_colors.iter().copied())
-            .await
             .unwrap();
     }
 
     /// Renders one frame of a palette-cycling effect (FastLED's `ColorFromPalette`): each
     /// pixel's color comes from `RAINBOW_COLORS`, indexed by its spatial position plus a
     /// time index that advances by one every call, both wrapping around at 256.
-    pub async fn palette_frame(&mut self) {
+    pub fn palette_frame(&mut self) {
         let mut spatial_index: u8 = self.palette_time_index;
         for i in 0..NUM_LEDS {
             let color = color_from_palette16(
@@ -173,11 +178,10 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
 
         self.leds
             .write(self.led_colors.iter().copied())
-            .await
             .unwrap();
     }
 
-    pub async fn rainbow_frame(&mut self, millis: u64) {
+    pub fn rainbow_frame(&mut self, millis: u64) {
         let time_hue = (millis / RAINBOW_MILLIS_PER_STEP) as u8;
 
         // lib8tion's sin16/cos16 take a `u16` spanning a full circle, so truncating `millis`
@@ -202,7 +206,6 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
                     b: color.b,
                 }
             }))
-            .await
             .unwrap();
     }
 }

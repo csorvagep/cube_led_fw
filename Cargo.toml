@@ -8,6 +8,13 @@ version = "0.1.0"
 name = "cubeled"
 path = "./src/bin/main.rs"
 
+# Host-only tool (see src/bin/ota_flash.rs); built only with `--features std`, since it needs
+# std (TCP sockets, process spawning) which isn't available on the default riscv32 target.
+[[bin]]
+name = "ota_flash"
+path = "./src/bin/ota_flash.rs"
+required-features = ["std"]
+
 [dependencies]
 defmt = "1.0.1"
 critical-section = "1.2.0"
