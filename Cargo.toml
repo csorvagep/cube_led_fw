@@ -43,6 +43,9 @@ static_cell = "2"
 esp-alloc = "0.9"
 esp-radio = { version = "0.17", features = ["defmt", "esp32c3", "wifi"] }
 esp-rtos = { version = "0.2.0", features = ["embassy", "esp32c3", "defmt", "esp-radio"] }
+esp-storage = { version = "0.8.1", features = ["esp32c3", "defmt"] }
+embedded-storage = "0.3.1"
+embedded-io-async = "0.6"
 
 
 [profile.dev]
