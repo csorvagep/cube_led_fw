@@ -233,8 +233,8 @@ async fn wifi_task(mut controller: WifiController<'static>) {
         info!("Connecting to wifi...");
         match controller.connect_async().await {
             Ok(()) => info!("Wifi connected"),
-            Err(_) => {
-                info!("Failed to connect to wifi, retrying");
+            Err(e) => {
+                info!("Failed to connect to wifi: {}, retrying", e);
                 Timer::after(Duration::from_secs(5)).await;
             }
         }
@@ -377,7 +377,10 @@ async fn main(spawner: Spawner) {
     match dhcp_config {
         Ok(config) => info!("Got IP via DHCP: {}", config.address),
         Err(_) => {
-            info!("No DHCP lease after {}s, falling back to static IP", DHCP_TIMEOUT.as_secs());
+            info!(
+                "No DHCP lease after {}s, falling back to static IP",
+                DHCP_TIMEOUT.as_secs()
+            );
             net_stack.set_config_v4(ConfigV4::Static(StaticConfigV4 {
                 address: Ipv4Cidr::new(STATIC_IP, 24),
                 gateway: Some(STATIC_GATEWAY),
