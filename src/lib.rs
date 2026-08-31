@@ -8,4 +8,6 @@ pub mod adxl362;
 pub mod layout3d;
 #[cfg(target_arch = "riscv32")]
 pub mod led_control;
+#[cfg(target_arch = "riscv32")]
+pub mod ota;
 pub mod vec3;
