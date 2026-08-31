@@ -150,9 +150,7 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
                 b: src.b,
             };
         }
-        self.leds
-            .write(self.led_colors.iter().copied())
-            .unwrap();
+        self.leds.write(self.led_colors.iter().copied()).unwrap();
     }
 
     /// Renders one frame of a palette-cycling effect (FastLED's `ColorFromPalette`): each
@@ -176,9 +174,7 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
         }
         self.palette_time_index = self.palette_time_index.wrapping_add(1);
 
-        self.leds
-            .write(self.led_colors.iter().copied())
-            .unwrap();
+        self.leds.write(self.led_colors.iter().copied()).unwrap();
     }
 
     pub fn rainbow_frame(&mut self, millis: u64) {
