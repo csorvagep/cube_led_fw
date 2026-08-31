@@ -93,8 +93,6 @@ mod led_task_mod {
     use embassy_futures::select::{Either, select};
     use embassy_time::{Duration, Ticker};
 
-    use crate::led_task_mod::Effect::LarsonScanner;
-
     use super::{LedCommand, SharedLedControl};
 
     const FRAME_INTERVAL: Duration = Duration::from_millis(50);
@@ -121,7 +119,7 @@ mod led_task_mod {
     #[embassy_executor::task]
     pub async fn led_task(mut led_control: SharedLedControl) {
         let mut ticker = Ticker::every(FRAME_INTERVAL);
-        let mut effect = Effect::LarsonScanner;
+        let mut effect = Effect::Rainbow;
         let mut enabled = true;
         // Set while showing Wi-Fi connection status, pausing normal effect rendering until
         // the next `NextEffect` command.
