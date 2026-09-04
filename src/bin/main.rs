@@ -16,6 +16,7 @@ use cubeled::led_control::{
     BLACK, GREEN, LED_BUFFER_SIZE, LedControl, RED, SharedLedControl, YELLOW,
 };
 use cubeled::ota::{log_booted_partition, ota_task};
+use cubeled::sleep_control::{WakeReason, classify_wakeup, enter_deep_sleep};
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -30,6 +31,7 @@ use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::rng::Rng;
+use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
@@ -213,7 +215,14 @@ async fn button_task(mut btn: Input<'static>) {
 }
 
 #[embassy_executor::task]
-async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
+async fn sensor_task(
+    mut adxl_int2_pin: esp_hal::peripherals::GPIO4<'static>,
+    mut accel: Accel,
+    mut rtc: Rtc<'static>,
+    mut ld_on: Output<'static>,
+) {
+    let mut adxl_int2 = Input::new(adxl_int2_pin.reborrow(), InputConfig::default());
+
     // Number of 100ms ticks of continued inactivity before the LEDs turn off.
     const INACTIVITY_OFF_TICKS: u32 = 10_000 / 100;
     let mut inactivity_ticks: Option<u32> = None;
@@ -362,7 +371,26 @@ async fn wait_for_ip(stack: embassy_net::Stack<'static>) {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+    let mut peripherals = esp_hal::init(config);
+
+    // LD_ON pin: forced low immediately so LEDs stay off until fully initialized below.
+    let mut ld_on = Output::new(
+        peripherals.GPIO7,
+        esp_hal::gpio::Level::Low,
+        OutputConfig::default(),
+    );
+    ld_on.set_low();
+
+    // Checked before any other init so a plain RTC-timer wakeup with nothing to do can
+    // go straight back to sleep without powering up the LEDs, accelerometer, or Wi-Fi.
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    match classify_wakeup() {
+        WakeReason::TimerElapsed => {
+            info!("RTC wakeup with nothing to do, going back to sleep");
+            enter_deep_sleep(&mut rtc, &mut ld_on, &mut peripherals.GPIO4);
+        }
+        reason => info!("Wakeup reason: {}", reason),
+    }
 
     let mut flash = FlashStorage::new(peripherals.FLASH);
     log_booted_partition(&mut flash);
@@ -371,22 +399,11 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // LD_ON pin
-    let mut ld_on = Output::new(
-        peripherals.GPIO7,
-        esp_hal::gpio::Level::Low,
-        OutputConfig::default(),
-    );
-    ld_on.set_low();
-
     // BTN
     let btn = Input::new(
         peripherals.GPIO9,
         InputConfig::default().with_pull(Pull::Up),
     );
-
-    // ADXL362 INT2 (activity/inactivity)
-    let adxl_int2 = Input::new(peripherals.GPIO4, InputConfig::default());
 
     // LED driver
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
@@ -451,7 +468,9 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(led_task(led_control)).unwrap();
     spawner.spawn(button_task(btn)).unwrap();
-    spawner.spawn(sensor_task(adxl_int2, accel)).unwrap();
+    spawner
+        .spawn(sensor_task(peripherals.GPIO4, accel, rtc, ld_on))
+        .unwrap();
 
     // Wi-Fi/OTA stay uninitialized until the first long button press; see `WIFI_TOGGLE`.
     WIFI_TOGGLE.wait().await;
