@@ -10,4 +10,6 @@ pub mod layout3d;
 pub mod led_control;
 #[cfg(target_arch = "riscv32")]
 pub mod ota;
+#[cfg(target_arch = "riscv32")]
+pub mod sleep_control;
 pub mod vec3;
