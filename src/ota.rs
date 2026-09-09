@@ -12,6 +12,8 @@ use esp_bootloader_esp_idf::partitions::{
 use esp_hal::system::software_reset;
 use esp_storage::FlashStorage;
 
+use crate::led_control::{LED_CHANNEL, LedCommand};
+
 const OTA_PORT: u16 = 3232;
 
 #[embassy_executor::task]
@@ -36,19 +38,25 @@ pub async fn ota_task(stack: Stack<'static>, mut flash: FlashStorage<'static>) {
             continue;
         }
         info!("OTA client connected");
+        LED_CHANNEL.send(LedCommand::ShowOtaInProgress).await;
 
         match receive_ota_image(&mut socket, &mut flash).await {
             Ok(()) => {
                 info!("OTA image applied, rebooting into new firmware");
+                LED_CHANNEL.send(LedCommand::ShowOtaSuccess).await;
                 let _ = socket.flush().await;
                 Timer::after(Duration::from_millis(200)).await;
                 software_reset();
             }
-            Err(e) => info!("OTA update failed: {}", e),
+            Err(e) => {
+                info!("OTA update failed: {}", e);
+                LED_CHANNEL.send(LedCommand::ResumeAnimation).await;
+            }
         }
         socket.close();
     }
 }
+
 
 // Only relevant with a rollback-capable bootloader (the prebuilt one espflash ships isn't),
 // but marking the slot valid here is cheap insurance either way.

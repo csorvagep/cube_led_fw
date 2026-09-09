@@ -1,0 +1,1 @@
+espflash monitor --chip esp32c3 --log-format defmt --port COM11 --elf target/riscv32imc-unknown-none-elf/release/cubeled --before no-reset-no-sync
