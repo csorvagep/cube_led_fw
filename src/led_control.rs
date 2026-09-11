@@ -2,14 +2,35 @@ use color8::palette::{ColorBlend, color_from_palette16};
 use color8::presets::RAINBOW_COLORS;
 use color8::rgb::Crgb;
 use color8::{Chsv, fade_to_black_by, nscale8};
+use defmt::info;
+use embassy_futures::select::{Either, select};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_time::{Duration, Ticker};
 use esp_hal_smartled::{SmartLedsAdapter, buffer_size};
-use lib8tion::{cos16, sin16};
+use lib8tion::{Fract8, beat8, cos16, scale8, sin16, triwave8};
 use smart_leds::{RGB8, SmartLedsWrite as _};
 
 use crate::layout3d::{CubeFaces, Layout3d};
 use crate::vec3::Vec3;
 
 pub const NUM_LEDS: usize = 150;
+
+// `led_task` is the sole owner of `LedControl`; other tasks (including `ota_task`, in a
+// separate crate module) send it commands over this channel instead of sharing it behind
+// a mutex.
+pub enum LedCommand {
+    NextEffect,
+    SetEnabled(bool),
+    ShowWifiConnecting,
+    ShowWifiConnected,
+    ShowWifiOff,
+    ShowOtaInProgress,
+    ShowOtaSuccess,
+    ResumeAnimation,
+}
+
+pub static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
 
 // Hoisted out of the generic impl below: rustc rejects associated consts in
 // a `[T; N]` array-length position inside `impl<const BUFFER_SIZE: usize>`.
@@ -27,7 +48,7 @@ const COLS: usize = 5;
 const LEVEL: u8 = 30;
 
 // Shared max brightness applied by every effect.
-const BRIGHTNESS: u8 = 60;
+const BRIGHTNESS: u8 = 45;
 
 // Larson scanner ("Knight Rider") tuning.
 const SCANNER_COLOR: RGB8 = RGB8 { r: 255, g: 0, b: 0 };
@@ -37,6 +58,9 @@ const SCANNER_FADE_BY: u8 = 64;
 // wrapping integer math — no need for floating-point rem_euclid or a num_traits dependency.
 const RAINBOW_POS_SCALE: f32 = 0.75;
 const RAINBOW_MILLIS_PER_STEP: u64 = 40;
+
+// Pulsating effect
+const PULSE_BPM: u16 = 15;
 
 pub const BLACK: RGB8 = RGB8 { r: 0, g: 0, b: 0 };
 pub const RED: RGB8 = RGB8 {
@@ -75,6 +99,19 @@ pub const WHITE: RGB8 = RGB8 {
     b: LEVEL,
 };
 
+// Local extension trait: neither `Crgb` (color8) nor `RGB8` (rgb crate) is defined in this
+// crate, so a direct `impl From<Crgb> for RGB8` would violate the orphan rule. Defining our
+// own trait sidesteps that, since only the trait itself needs to be local.
+trait ToRgb8 {
+    fn to_rgb8(self) -> RGB8;
+}
+
+impl ToRgb8 for Crgb {
+    fn to_rgb8(self) -> RGB8 {
+        RGB8::new(self.r, self.g, self.b)
+    }
+}
+
 fn meander_index(logical: usize) -> usize {
     let row = logical / COLS;
     let col = logical % COLS;
@@ -83,6 +120,18 @@ fn meander_index(logical: usize) -> usize {
     } else {
         row * COLS + (COLS - 1 - col)
     }
+}
+
+/// A triangular pulse: the first half of the beat cycle ramps linearly `0..=highest..=0`
+/// (via `triwave8`), the second half stays flat at 0 — a straight-edged analog of
+/// `beatsin8`'s clamped-lower-half sine, snapping off for half its cycle instead of
+/// following a curve.
+fn beattri8_clamped(bpm: u16, highest: u8, phase_offset: u8, now_millis: u32) -> u8 {
+    let beat = beat8(bpm, 0, now_millis).wrapping_add(phase_offset);
+    if beat >= 128 {
+        return 0;
+    }
+    scale8(triwave8(beat * 2), Fract8(highest))
 }
 
 pub struct LedControl<'a, const BUFFER_SIZE: usize> {
@@ -144,11 +193,7 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
         nscale8(&mut frame, BRIGHTNESS);
 
         for (dst, src) in self.led_colors.iter_mut().zip(frame.iter()) {
-            *dst = RGB8 {
-                r: src.r,
-                g: src.g,
-                b: src.b,
-            };
+            *dst = src.to_rgb8();
         }
         self.leds.write(self.led_colors.iter().copied()).unwrap();
     }
@@ -165,11 +210,7 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
                 BRIGHTNESS,
                 ColorBlend::LinearBlend,
             );
-            self.led_colors[i] = RGB8 {
-                r: color.r,
-                g: color.g,
-                b: color.b,
-            };
+            self.led_colors[i] = color.to_rgb8();
             spatial_index = spatial_index.wrapping_add(1);
         }
         self.palette_time_index = self.palette_time_index.wrapping_add(1);
@@ -196,12 +237,124 @@ impl<'a, const BUFFER_SIZE: usize> LedControl<'a, BUFFER_SIZE> {
                 let pos_hue = (point.dot(dir) * RAINBOW_POS_SCALE) as i32 as u8;
                 let color =
                     Crgb::from(Chsv::from_hue(pos_hue.wrapping_add(time_hue))).scale8(BRIGHTNESS);
-                RGB8 {
-                    r: color.r,
-                    g: color.g,
-                    b: color.b,
-                }
+                color.to_rgb8()
             }))
             .unwrap();
+    }
+
+    pub fn pulse_frame(&mut self, millis: u64) {
+        self.fill(
+            Crgb {
+                r: beattri8_clamped(PULSE_BPM, BRIGHTNESS, 0, millis as u32),
+                g: 0, //beattri8_clamped(PULSE_BPM, BRIGHTNESS, 85, millis as u32),
+                b: 0, //beattri8_clamped(PULSE_BPM, BRIGHTNESS, 170, millis as u32),
+            }
+            .to_rgb8(),
+        );
+    }
+}
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, PartialEq)]
+enum Effect {
+    Palette,
+    Rainbow,
+    Pulse,
+    LarsonScanner,
+    Off,
+}
+
+impl Effect {
+    fn next(self) -> Self {
+        match self {
+            Effect::Palette => Effect::Rainbow,
+            Effect::Rainbow => Effect::Pulse,
+            Effect::Pulse => Effect::LarsonScanner,
+            Effect::LarsonScanner => Effect::Off,
+            Effect::Off => Effect::Palette,
+        }
+    }
+}
+
+#[embassy_executor::task]
+pub async fn led_task(mut led_control: SharedLedControl) {
+    let mut ticker = Ticker::every(FRAME_INTERVAL);
+    let mut effect = Effect::Rainbow;
+    let mut enabled = true;
+    // Set while showing Wi-Fi connection status, pausing normal effect rendering until
+    // the next `NextEffect` command.
+    let mut overridden = false;
+    loop {
+        // While running, keep rendering frames but stay ready to drop out the moment
+        // another command (next effect, activity change, ...) comes in.
+        let running = enabled && effect != Effect::Off && !overridden;
+        let command = if running {
+            match select(LED_CHANNEL.receive(), ticker.next()).await {
+                Either::First(command) => command,
+                Either::Second(()) => {
+                    match effect {
+                        Effect::Palette => led_control.palette_frame(),
+                        Effect::Rainbow => {
+                            led_control.rainbow_frame(embassy_time::Instant::now().as_millis())
+                        }
+                        Effect::Pulse => {
+                            led_control.pulse_frame(embassy_time::Instant::now().as_millis())
+                        }
+                        Effect::LarsonScanner => led_control.larson_scanner_frame(),
+                        Effect::Off => {}
+                    }
+                    continue;
+                }
+            }
+        } else {
+            LED_CHANNEL.receive().await
+        };
+
+        match command {
+            LedCommand::NextEffect => {
+                overridden = false;
+                effect = effect.next();
+                match effect {
+                    Effect::Palette => info!("Effect: palette"),
+                    Effect::Rainbow => info!("Effect: rainbow"),
+                    Effect::Pulse => info!("Effect: pulse"),
+                    Effect::LarsonScanner => info!("Effect: larson scanner"),
+                    Effect::Off => info!("Effect: off"),
+                }
+            }
+            LedCommand::SetEnabled(new_enabled) => enabled = new_enabled,
+            LedCommand::ShowWifiConnecting => {
+                overridden = true;
+                led_control.fill(YELLOW);
+            }
+            LedCommand::ShowWifiConnected => {
+                overridden = true;
+                led_control.fill(GREEN);
+            }
+            LedCommand::ShowWifiOff => {
+                overridden = true;
+                led_control.fill(RED);
+            }
+            LedCommand::ShowOtaInProgress => {
+                overridden = true;
+                led_control.fill(BLUE);
+            }
+            LedCommand::ShowOtaSuccess => {
+                overridden = true;
+                led_control.fill(BLACK);
+            }
+            LedCommand::ResumeAnimation => overridden = false,
+        }
+
+        if overridden {
+            // Leave the solid status color in place until the next effect change.
+        } else if enabled && effect != Effect::Off {
+            // The ticker fell behind while paused and would otherwise fire in a burst to
+            // catch up, making the next effect briefly run too fast.
+            ticker.reset();
+        } else {
+            led_control.fill(BLACK);
+        }
     }
 }

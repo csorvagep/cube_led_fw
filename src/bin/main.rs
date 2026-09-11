@@ -7,21 +7,21 @@
 )]
 #![deny(clippy::large_stack_frames)]
 
+use core::cell::Cell;
 use core::net::Ipv4Addr;
 
+use critical_section::Mutex;
 use cubeled::adxl362::{
     ActivityConfig, Adxl362, InactivityConfig, InterruptConfig, NoiseMode, OutputDataRate, Range,
 };
-use cubeled::led_control::{
-    BLACK, GREEN, LED_BUFFER_SIZE, LedControl, RED, SharedLedControl, YELLOW,
-};
+use cubeled::led_control::{LED_BUFFER_SIZE, LED_CHANNEL, LedCommand, LedControl, led_task};
 use cubeled::ota::{log_booted_partition, ota_task};
+use cubeled::sleep_control::{WakeReason, classify_wakeup, enter_deep_sleep};
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_net::{ConfigV4, Ipv4Cidr, Runner, StackResources, StaticConfigV4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Ticker, Timer, with_timeout};
 use esp_hal::clock::CpuClock;
@@ -30,6 +30,7 @@ use esp_hal::gpio::{Input, InputConfig, Output, OutputConfig, Pull};
 use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::rmt::{PulseCode, Rmt};
 use esp_hal::rng::Rng;
+use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
@@ -50,19 +51,15 @@ esp_bootloader_esp_idf::esp_app_desc!();
 // SPI stays blocking: ADXL362 transfers are tiny (3-8 bytes), not worth a DMA+async rewrite.
 type Accel = Adxl362<Spi<'static, esp_hal::Blocking>>;
 
-// `led_task` is the sole owner of `LedControl`; other tasks send it commands over this
-// channel instead of sharing it behind a mutex.
-enum LedCommand {
-    NextEffect,
-    SetEnabled(bool),
-    ShowWifiConnecting,
-    ShowWifiConnected,
-    ShowWifiOff,
-    ResumeAnimation,
-}
-
-static LED_CHANNEL: Channel<CriticalSectionRawMutex, LedCommand, 4> = Channel::new();
 static LED_BUF: StaticCell<[PulseCode; LED_BUFFER_SIZE]> = StaticCell::new();
+
+// Set while Wi-Fi/OTA is powered up (between toggles), so `sensor_task` can defer deep
+// sleep instead of dropping an active connection or in-progress OTA update.
+static WIFI_ACTIVE: Mutex<Cell<bool>> = Mutex::new(Cell::new(false));
+
+fn wifi_active() -> bool {
+    critical_section::with(|cs| WIFI_ACTIVE.borrow(cs).get())
+}
 
 // Wi-Fi (and OTA) are off until the user holds the button for `LONG_PRESS_DURATION`, both
 // to avoid the RMT/Wi-Fi interrupt contention glitch during normal operation and to save
@@ -79,114 +76,6 @@ static NET_RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
 const STATIC_IP: Ipv4Addr = Ipv4Addr::new(192, 168, 137, 50);
 const STATIC_GATEWAY: Ipv4Addr = Ipv4Addr::new(192, 168, 137, 1);
 const DHCP_TIMEOUT: Duration = Duration::from_secs(30);
-
-// A module boundary is needed here: an `#[allow(clippy::large_stack_frames)]` placed
-// directly on an `#[embassy_executor::task]` fn doesn't reach the coroutine clippy
-// actually measures, since the task macro's expansion doesn't forward it that deep.
-mod led_task_mod {
-    #![allow(
-        clippy::large_stack_frames,
-        reason = "led_task owns the full LED color buffer for its whole lifetime"
-    )]
-
-    use defmt::info;
-    use embassy_futures::select::{Either, select};
-    use embassy_time::{Duration, Ticker};
-
-    use super::{LedCommand, SharedLedControl};
-
-    const FRAME_INTERVAL: Duration = Duration::from_millis(50);
-
-    #[derive(Clone, Copy, PartialEq)]
-    enum Effect {
-        Palette,
-        Rainbow,
-        LarsonScanner,
-        Off,
-    }
-
-    impl Effect {
-        fn next(self) -> Self {
-            match self {
-                Effect::Palette => Effect::Rainbow,
-                Effect::Rainbow => Effect::LarsonScanner,
-                Effect::LarsonScanner => Effect::Off,
-                Effect::Off => Effect::Palette,
-            }
-        }
-    }
-
-    #[embassy_executor::task]
-    pub async fn led_task(mut led_control: SharedLedControl) {
-        let mut ticker = Ticker::every(FRAME_INTERVAL);
-        let mut effect = Effect::Rainbow;
-        let mut enabled = true;
-        // Set while showing Wi-Fi connection status, pausing normal effect rendering until
-        // the next `NextEffect` command.
-        let mut overridden = false;
-        loop {
-            // While running, keep rendering frames but stay ready to drop out the moment
-            // another command (next effect, activity change, ...) comes in.
-            let running = enabled && effect != Effect::Off && !overridden;
-            let command = if running {
-                match select(super::LED_CHANNEL.receive(), ticker.next()).await {
-                    Either::First(command) => command,
-                    Either::Second(()) => {
-                        match effect {
-                            Effect::Palette => led_control.palette_frame(),
-                            Effect::Rainbow => {
-                                led_control.rainbow_frame(embassy_time::Instant::now().as_millis())
-                            }
-                            Effect::LarsonScanner => led_control.larson_scanner_frame(),
-                            Effect::Off => {}
-                        }
-                        continue;
-                    }
-                }
-            } else {
-                super::LED_CHANNEL.receive().await
-            };
-
-            match command {
-                LedCommand::NextEffect => {
-                    overridden = false;
-                    effect = effect.next();
-                    match effect {
-                        Effect::Palette => info!("Effect: palette"),
-                        Effect::Rainbow => info!("Effect: rainbow"),
-                        Effect::LarsonScanner => info!("Effect: larson scanner"),
-                        Effect::Off => info!("Effect: off"),
-                    }
-                }
-                LedCommand::SetEnabled(new_enabled) => enabled = new_enabled,
-                LedCommand::ShowWifiConnecting => {
-                    overridden = true;
-                    led_control.fill(super::YELLOW);
-                }
-                LedCommand::ShowWifiConnected => {
-                    overridden = true;
-                    led_control.fill(super::GREEN);
-                }
-                LedCommand::ShowWifiOff => {
-                    overridden = true;
-                    led_control.fill(super::RED);
-                }
-                LedCommand::ResumeAnimation => overridden = false,
-            }
-
-            if overridden {
-                // Leave the solid status color in place until the next effect change.
-            } else if enabled && effect != Effect::Off {
-                // The ticker fell behind while paused and would otherwise fire in a burst to
-                // catch up, making the next effect briefly run too fast.
-                ticker.reset();
-            } else {
-                led_control.fill(super::BLACK);
-            }
-        }
-    }
-}
-use led_task_mod::led_task;
 
 #[embassy_executor::task]
 async fn button_task(mut btn: Input<'static>) {
@@ -213,11 +102,29 @@ async fn button_task(mut btn: Input<'static>) {
 }
 
 #[embassy_executor::task]
-async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
-    // Number of 100ms ticks of continued inactivity before the LEDs turn off.
-    const INACTIVITY_OFF_TICKS: u32 = 10_000 / 100;
+async fn sensor_task(
+    mut adxl_int2_pin: esp_hal::peripherals::GPIO4<'static>,
+    mut accel: Accel,
+    mut rtc: Rtc<'static>,
+    mut ld_on: Output<'static>,
+) {
+    let mut adxl_int2 = Input::new(adxl_int2_pin.reborrow(), InputConfig::default());
+
+    const INACTIVITY_SLEEP_SECONDS: u32 = 30;
+    const TICK_MILLIS: u32 = 100;
+    const INACTIVITY_SLEEP_TICKS: u32 = INACTIVITY_SLEEP_SECONDS * 1000 / TICK_MILLIS;
     let mut inactivity_ticks: Option<u32> = None;
-    let mut ticker = Ticker::every(Duration::from_millis(100));
+    let mut ticker = Ticker::every(Duration::from_millis(TICK_MILLIS as u64));
+
+    // INT2 is level-triggered: if activity woke the CPU from deep sleep, it may already be
+    // asserted here, and the edge that caused it won't happen again for wait_for_rising_edge.
+    if adxl_int2.is_high() {
+        let status = accel.read_status().expect("Failed to read ADXL362 status");
+        if status.act {
+            info!("Activity detected");
+            LED_CHANNEL.send(LedCommand::SetEnabled(true)).await;
+        }
+    }
 
     loop {
         match select(adxl_int2.wait_for_rising_edge(), ticker.next()).await {
@@ -230,14 +137,20 @@ async fn sensor_task(mut adxl_int2: Input<'static>, mut accel: Accel) {
                 }
                 if status.inact {
                     info!("Inactivity detected");
-                    inactivity_ticks = Some(INACTIVITY_OFF_TICKS);
+                    inactivity_ticks = Some(INACTIVITY_SLEEP_TICKS);
                 }
             }
             Either::Second(()) => {
                 if let Some(ticks) = inactivity_ticks {
                     if ticks == 0 {
-                        inactivity_ticks = None;
-                        LED_CHANNEL.send(LedCommand::SetEnabled(false)).await;
+                        if wifi_active() {
+                            // Stay awake while Wi-Fi/OTA is on; re-check on the next tick.
+                            inactivity_ticks = Some(0);
+                        } else {
+                            info!("Inactive, going to deep sleep");
+                            drop(adxl_int2);
+                            enter_deep_sleep(&mut rtc, &mut ld_on, &mut adxl_int2_pin);
+                        }
                     } else {
                         inactivity_ticks = Some(ticks - 1);
                     }
@@ -267,6 +180,7 @@ async fn wifi_task(mut controller: WifiController<'static>, stack: embassy_net::
         );
         controller.set_config(&client_config).unwrap();
         controller.start_async().await.unwrap();
+        critical_section::with(|cs| WIFI_ACTIVE.borrow(cs).set(true));
 
         // Keep retrying to connect until either connected, or toggled off in the meantime.
         let connected = loop {
@@ -310,6 +224,7 @@ async fn wifi_task(mut controller: WifiController<'static>, stack: embassy_net::
         info!("Stopping wifi");
         let _ = controller.disconnect_async().await;
         let _ = controller.stop_async().await;
+        critical_section::with(|cs| WIFI_ACTIVE.borrow(cs).set(false));
         LED_CHANNEL.send(LedCommand::ShowWifiOff).await;
         Timer::after(Duration::from_secs(1)).await;
         LED_CHANNEL.send(LedCommand::ResumeAnimation).await;
@@ -362,7 +277,26 @@ async fn wait_for_ip(stack: embassy_net::Stack<'static>) {
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+    let mut peripherals = esp_hal::init(config);
+
+    // LD_ON pin: forced low immediately so LEDs stay off until fully initialized below.
+    let mut ld_on = Output::new(
+        peripherals.GPIO7,
+        esp_hal::gpio::Level::Low,
+        OutputConfig::default(),
+    );
+    ld_on.set_low();
+
+    // Checked before any other init so a plain RTC-timer wakeup with nothing to do can
+    // go straight back to sleep without powering up the LEDs, accelerometer, or Wi-Fi.
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    match classify_wakeup() {
+        WakeReason::TimerElapsed => {
+            info!("RTC wakeup with nothing to do, going back to sleep");
+            enter_deep_sleep(&mut rtc, &mut ld_on, &mut peripherals.GPIO4);
+        }
+        reason => info!("Wakeup reason: {}", reason),
+    }
 
     let mut flash = FlashStorage::new(peripherals.FLASH);
     log_booted_partition(&mut flash);
@@ -371,32 +305,19 @@ async fn main(spawner: Spawner) {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
 
-    // LD_ON pin
-    let mut ld_on = Output::new(
-        peripherals.GPIO7,
-        esp_hal::gpio::Level::Low,
-        OutputConfig::default(),
-    );
-    ld_on.set_low();
-
     // BTN
     let btn = Input::new(
         peripherals.GPIO9,
         InputConfig::default().with_pull(Pull::Up),
     );
 
-    // ADXL362 INT2 (activity/inactivity)
-    let adxl_int2 = Input::new(peripherals.GPIO4, InputConfig::default());
-
     // LED driver
     let rmt = Rmt::new(peripherals.RMT, Rate::from_mhz(80)).unwrap();
     let led_buffer = LED_BUF.init([PulseCode::default(); LED_BUFFER_SIZE]);
     let leds = SmartLedsAdapter::new(rmt.channel0, peripherals.GPIO8, led_buffer);
-    let mut led_control = LedControl::new(leds);
+    let led_control = LedControl::new(leds);
 
     info!("CubeLED started");
-    info!("Filling cube with color YELLOW");
-    led_control.fill(YELLOW);
 
     // SPI
     let mosi = peripherals.GPIO3;
@@ -451,7 +372,9 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(led_task(led_control)).unwrap();
     spawner.spawn(button_task(btn)).unwrap();
-    spawner.spawn(sensor_task(adxl_int2, accel)).unwrap();
+    spawner
+        .spawn(sensor_task(peripherals.GPIO4, accel, rtc, ld_on))
+        .unwrap();
 
     // Wi-Fi/OTA stay uninitialized until the first long button press; see `WIFI_TOGGLE`.
     WIFI_TOGGLE.wait().await;
